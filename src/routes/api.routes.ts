@@ -13,6 +13,13 @@ import {
     syncRosters
 } from '../services/sync.service.js';
 import { getSchedulerStatus } from '../services/scheduler.service.js';
+import { nflCollector } from '../services/nfl-collector.service.js';
+import { newsScraper } from '../services/news-scraper.service.js';
+import { leagueAnalytics } from '../services/league-analytics.service.js';
+import { kbGenerator } from '../services/kb-generator.service.js';
+import { hermesAgent } from '../services/hermes-agent.service.js';
+import { weeklySchedule } from '../services/weekly-schedule.service.js';
+import { gameWatcher } from '../services/game-watcher.service.js';
 
 const router = Router();
 
@@ -478,8 +485,30 @@ router.get('/leagues/:leagueId/rosters/:rosterId/players', (req: Request, res: R
         const playerIds = JSON.parse(roster.players || '[]') as string[];
         const starterIds = JSON.parse(roster.starters || '[]') as string[];
 
-        // 1. Get traded picks for this roster
-        const tradedPicks = query<{
+        // 1. Resolve All Draft Picks (Natural + Traded)
+        // A) Get context
+        const league = queryOne<{ settings: string, season: string }>('SELECT settings, season FROM leagues WHERE league_id = ?', [leagueId]);
+        const state = queryOne<{ league_season: string, season: string }>('SELECT league_season, season FROM nfl_state WHERE id = 1');
+        
+        const settings = JSON.parse(league?.settings || '{}');
+        const draftRounds = settings.draft_rounds || 4;
+        const currentSeason = parseInt(state?.league_season || state?.season || league?.season || '2025');
+        
+        // B) Generate Natural Picks for the next 3 years
+        const years = [currentSeason, currentSeason + 1, currentSeason + 2];
+        const naturalPicks = [];
+        for (const year of years) {
+            for (let round = 1; round <= draftRounds; round++) {
+                naturalPicks.push({
+                    season: year.toString(),
+                    round,
+                    original_owner_id: parseInt(rosterId)
+                });
+            }
+        }
+
+        // C) Get picks acquired by this roster
+        const acquiredPicks = query<{
             season: string;
             round: number;
             original_owner_id: number;
@@ -489,19 +518,46 @@ router.get('/leagues/:leagueId/rosters/:rosterId/players', (req: Request, res: R
             FROM traded_picks tp
             LEFT JOIN rosters r ON tp.league_id = r.league_id AND tp.original_owner_id = r.roster_id
             LEFT JOIN sleeper_users su ON r.owner_id = su.user_id
-            WHERE tp.league_id = ? AND tp.current_owner_id = ?
-        `, [leagueId, rosterId]);
+            WHERE tp.league_id = ? AND tp.current_owner_id = ? AND tp.original_owner_id != ?
+        `, [leagueId, rosterId, rosterId]);
 
-        // Map picks to "player-like" objects
-        const pickItems = tradedPicks.map(p => ({
+        // D) Get picks traded AWAY by this roster
+        const tradedAwayPicks = query(`
+            SELECT season, round 
+            FROM traded_picks 
+            WHERE league_id = ? AND original_owner_id = ? AND current_owner_id != ?
+        `, [leagueId, rosterId, rosterId]);
+
+        // E) Combine: Natural picks not traded away + Acquired picks
+        const finalPicks = [
+            ...naturalPicks.filter(np => 
+                !tradedAwayPicks.some((ta: any) => ta.season === np.season && ta.round === np.round)
+            ).map(p => ({
+                ...p,
+                owner_name: 'Own'
+            })),
+            ...acquiredPicks
+        ];
+
+        // F) Get this roster's owner name for "Own" picks
+        const ownRoster = queryOne<{ owner_name: string }>(`
+            SELECT su.display_name as owner_name
+            FROM rosters r
+            LEFT JOIN sleeper_users su ON r.owner_id = su.user_id
+            WHERE r.league_id = ? AND r.roster_id = ?
+        `, [leagueId, rosterId]);
+        const ownerDisplayName = ownRoster?.owner_name || `Time ${rosterId}`;
+
+        // G) Map picks to "player-like" objects
+        const pickItems = finalPicks.map(p => ({
             player_id: `pick_${p.season}_${p.round}_${p.original_owner_id}`,
-            full_name: `${p.season} Round ${p.round} (${p.owner_name})`,
+            full_name: `${p.season} Round ${p.round} (${p.original_owner_id === parseInt(rosterId) ? ownerDisplayName : p.owner_name})`,
             position: 'PICK',
             team: 'DRAFT',
             is_pick: true,
             pick_season: p.season,
             pick_round: p.round,
-            original_owner_name: p.owner_name,
+            original_owner_name: p.original_owner_id === parseInt(rosterId) ? ownerDisplayName : p.owner_name,
             search_rank: 99999 + p.round // Lower rounds at the end
         }));
 
@@ -1031,6 +1087,207 @@ router.get('/sync/logs', (req: Request, res: Response) => {
 
     const logs = query(sql, params);
     res.json({ data: logs });
+});
+
+// ========================
+// KNOWLEDGE BASE & BOT ROUTES
+// ========================
+
+router.get('/kb/status', (req: Request, res: Response) => {
+    try {
+        const families = leagueAnalytics.getLeagueFamilies();
+        const newsCount = queryOne<{ c: number }>('SELECT COUNT(*) as c FROM fantasy_news')?.c || 0;
+        const nflGamesCount = queryOne<{ c: number }>('SELECT COUNT(*) as c FROM nfl_games')?.c || 0;
+        const playerStatsCount = queryOne<{ c: number }>('SELECT COUNT(*) as c FROM nfl_player_stats')?.c || 0;
+
+        res.json({
+            status: 'ok',
+            league_families: families.map(f => ({
+                name: f.name,
+                slug: f.slug,
+                seasons: f.seasons.map(s => s.season)
+            })),
+            stats: {
+                news_items: newsCount,
+                nfl_games: nflGamesCount,
+                nfl_player_stats: playerStatsCount
+            }
+        });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/kb/leagues', (req: Request, res: Response) => {
+    try {
+        const families = leagueAnalytics.getLeagueFamilies();
+        res.json({ data: families });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/kb/leagues/:slug/managers', (req: Request, res: Response) => {
+    try {
+        const families = leagueAnalytics.getLeagueFamilies();
+        const family = families.find(f => f.slug === req.params.slug);
+        if (!family) return res.status(404).json({ error: 'League not found' });
+
+        const managers = leagueAnalytics.getManagerCareerStats(family);
+        res.json({ data: managers });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/kb/leagues/:slug/h2h', (req: Request, res: Response) => {
+    try {
+        const families = leagueAnalytics.getLeagueFamilies();
+        const family = families.find(f => f.slug === req.params.slug);
+        if (!family) return res.status(404).json({ error: 'League not found' });
+
+        const h2h = leagueAnalytics.getH2HMatrix(family);
+        res.json({ data: h2h });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/kb/leagues/:slug/trades', (req: Request, res: Response) => {
+    try {
+        const families = leagueAnalytics.getLeagueFamilies();
+        const family = families.find(f => f.slug === req.params.slug);
+        if (!family) return res.status(404).json({ error: 'League not found' });
+
+        const trades = leagueAnalytics.getTradeHistory(family);
+        res.json({ data: trades });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/kb/leagues/:slug/records', (req: Request, res: Response) => {
+    try {
+        const families = leagueAnalytics.getLeagueFamilies();
+        const family = families.find(f => f.slug === req.params.slug);
+        if (!family) return res.status(404).json({ error: 'League not found' });
+
+        const records = leagueAnalytics.getAllTimeRecords(family);
+        res.json({ data: records });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/kb/nfl/news', (req: Request, res: Response) => {
+    try {
+        const { limit = 20, category } = req.query;
+        const news = newsScraper.getLatestNews(Number(limit), category as string);
+        res.json({ data: news });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// WhatsApp Bot Formatted Text Endpoints
+router.get('/kb/whatsapp/weekly-recap/:leagueId/:week', (req: Request, res: Response) => {
+    try {
+        const text = hermesAgent.formatWhatsAppWeeklyRecap(req.params.leagueId, Number(req.params.week));
+        res.json({ text });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/kb/whatsapp/trade/:tradeId', (req: Request, res: Response) => {
+    try {
+        const text = hermesAgent.formatWhatsAppTradeVerdict(req.params.tradeId);
+        res.json({ text });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.get('/kb/whatsapp/preview/:leagueSlug/:managerA/:managerB', (req: Request, res: Response) => {
+    try {
+        const text = hermesAgent.formatWhatsAppMatchupPreview(req.params.leagueSlug, req.params.managerA, req.params.managerB);
+        res.json({ text });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Trigger Generation & Sync
+router.post('/kb/generate', async (req: Request, res: Response) => {
+    try {
+        const result = await kbGenerator.generateAll();
+        res.json({ message: 'Knowledge Base generated successfully', ...result });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ========================
+// BOT EDITORIAL SCHEDULE ROUTES
+// ========================
+
+router.get('/bot/schedule/slots', (req: Request, res: Response) => {
+    res.json({
+        slots: [
+            { key: 'tue_08h_recap', day: 'Terça', time: '08:00 BRT', title: 'Fechamento Geral Ácido & Raio-X Completo' },
+            { key: 'wed_08h_waiver_radar', day: 'Quarta', time: '08:00 BRT', title: 'Radar do Waiver Wire (Alvos Cobiçados)' },
+            { key: 'opening_08h_waivers', day: 'Dia do Kickoff', time: '08:00 BRT', title: 'Bloco 1: Plantão do Waiver Wire (Madrugada de 4ª p/ 5ª)' },
+            { key: 'opening_09h_standings', day: 'Dia do Kickoff', time: '09:00 BRT', title: 'Bloco 2: Termômetro da Liga & Disputa de Classificação' },
+            { key: 'opening_10h_matchups', day: 'Dia do Kickoff', time: '10:00 BRT', title: 'Bloco 3: Card de Confrontos & Rivalidades (H2H)' },
+            { key: 'opening_11h_injuries', day: 'Dia do Kickoff', time: '11:00 BRT', title: 'Bloco 4: Boletim Médico & Dúvidas dos Elencos' },
+            { key: 'opening_12h_trashtalk', day: 'Dia do Kickoff', time: '12:00 BRT', title: 'Bloco 5: Trash Talk & Palpites do Hermes pro Kickoff' },
+            { key: 'sun_08h_waivers_recap', day: 'Domingo', time: '08:00 BRT', title: 'Bloco 1: Rescaldo & Waivers de Sábado p/ Domingo' },
+            { key: 'sun_09h_matchups_update', day: 'Domingo', time: '09:00 BRT', title: 'Bloco 2: Card de Confrontos Atualizado (Parciais)' },
+            { key: 'sun_10h_injuries', day: 'Domingo', time: '10:00 BRT', title: 'Bloco 3: Boletim Médico Dominical' },
+            { key: 'sun_11h_trashtalk', day: 'Domingo', time: 'Kickoff - 120min', title: 'Bloco 4: Trash Talk & Aquecimento (2h antes do 1º Kickoff - Dinâmico BRT: 12:00 ou 13:00)' },
+            { key: 'sun_11h30_inactives', day: 'Domingo', time: 'Kickoff - 90min', title: 'Alerta Vermelho de Inativos (90min antes do 1º Kickoff - Dinâmico BRT: 12:30 ou 13:30)' },
+            { key: 'mon_08h_decisions', day: 'Segunda', time: '08:00 BRT', title: 'Decididos vs Dramas em Aberto no MNF' }
+        ]
+    });
+});
+
+router.get('/bot/schedule/preview/:leagueId/:slotKey', (req: Request, res: Response) => {
+    try {
+        const { leagueId, slotKey } = req.params;
+        const week = req.query.week ? Number(req.query.week) : 1;
+
+        let result;
+        switch (slotKey) {
+            case 'tue_08h_recap': result = weeklySchedule.generateTuesdayRecap(leagueId, week); break;
+            case 'wed_08h_waiver_radar': result = weeklySchedule.generateWednesdayWaiverRadar(leagueId); break;
+            case 'opening_08h_waivers': result = weeklySchedule.generateOpeningDay08hWaivers(leagueId, week); break;
+            case 'opening_09h_standings': result = weeklySchedule.generateOpeningDay09hStandings(leagueId, week); break;
+            case 'opening_10h_matchups': result = weeklySchedule.generateOpeningDay10hMatchups(leagueId, week); break;
+            case 'opening_11h_injuries': result = weeklySchedule.generateOpeningDay11hInjuries(leagueId, week); break;
+            case 'opening_12h_trashtalk': result = weeklySchedule.generateOpeningDay12hTrashTalk(leagueId, week); break;
+            case 'sun_08h_waivers_recap': result = weeklySchedule.generateSunday08hWaiversAndRecap(leagueId, week); break;
+            case 'sun_09h_matchups_update': result = weeklySchedule.generateSunday09hMatchupCardUpdate(leagueId, week); break;
+            case 'sun_10h_injuries': result = weeklySchedule.generateSunday10hInjuries(leagueId, week); break;
+            case 'sun_11h_trashtalk': result = weeklySchedule.generateSunday11hTrashTalk(leagueId, week); break;
+            case 'sun_11h30_inactives':
+            case 'sun_inactives_alert': result = weeklySchedule.generateSundayInactivesAlert(leagueId, week); break;
+            case 'mon_08h_decisions': result = weeklySchedule.generateMondayDecisions(leagueId, week); break;
+            default: return res.status(404).json({ error: `Unknown slot key: ${slotKey}` });
+        }
+
+        res.json(result);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+router.post('/bot/watcher/check', async (req: Request, res: Response) => {
+    try {
+        const check = await gameWatcher.checkLiveGames();
+        res.json({ message: 'Live game check completed', ...check });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
 export default router;

@@ -1,0 +1,90 @@
+{
+  "name": "SleeperLeagueKnowledgeBase",
+  "description": "Ferramentas para o agente Hermes consultar dados e gerar comentários para grupos de WhatsApp",
+  "tools": [
+    {
+      "name": "get_weekly_recap",
+      "description": "Retorna o placar dos confrontos, maior pontuador, lanterna e waivers de uma semana",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "league_slug": {
+            "type": "string",
+            "description": "Slug da liga (ex: high-stakes-fantasy, dynasty-pantreta)"
+          },
+          "week": {
+            "type": "number",
+            "description": "Número da semana (1-18)"
+          },
+          "season": {
+            "type": "string",
+            "description": "Temporada (ex: 2024, 2025)"
+          }
+        },
+        "required": [
+          "league_slug",
+          "week"
+        ]
+      }
+    },
+    {
+      "name": "get_h2h_rivalry",
+      "description": "Retorna o histórico completo de confrontos diretos entre dois managers",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "league_slug": {
+            "type": "string"
+          },
+          "manager_a": {
+            "type": "string"
+          },
+          "manager_b": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "league_slug",
+          "manager_a",
+          "manager_b"
+        ]
+      }
+    },
+    {
+      "name": "get_nfl_injuries_and_news",
+      "description": "Retorna notícias recentes e boletim médico da NFL",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "injury",
+              "waiver",
+              "trade",
+              "general"
+            ]
+          },
+          "limit": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    {
+      "name": "get_alltime_records",
+      "description": "Retorna os maiores e menores recordes de pontuação da história da liga",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "league_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "league_slug"
+        ]
+      }
+    }
+  ]
+}
